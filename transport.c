@@ -49,6 +49,25 @@ static void generate_initial_seq_num(context_t *ctx);
 static void control_loop(mysocket_t sd, context_t *ctx);
 
 
+int host_to_network(STCPHeader* header){
+  
+  header->th_seq = htonl(header->th_seq);
+  header->th_ack = htonl(header->th_ack);
+  header->th_win = htons(header->th_win);
+
+  return 0;
+}
+
+int network_to_host(STCPHeader* header){
+  
+  header->th_seq = ntohl(header->th_seq);
+  header->th_ack = ntohl(header->th_ack);
+  header->th_win = ntohs(header->th_win);
+
+  return 0;
+}
+
+
 
 /* initialise the transport layer, and start the main loop, handling
  * any data from the peer or the application.  this function should not
@@ -80,11 +99,13 @@ void transport_init(mysocket_t sd, bool_t is_active)
     if(is_active){
       header->th_flags = 0x02;
       header->th_seq = ctx->initial_sequence_num;
+      host_to_network(header);
       stcp_network_send(sd, header, sizeof(STCPHeader),NULL);
       
       ctx->current_sequence_num_other +=1;
 
       stcp_network_recv(sd,header,sizeof(STCPHeader));
+      network_to_host(header);
       if(header->th_flags!= (0x10|0x02))
         ;//some error
       ctx->initial_sequence_num_other = header->th_seq;
@@ -93,11 +114,13 @@ void transport_init(mysocket_t sd, bool_t is_active)
       //ack
       header->th_flags = 0x10;
       header->th_ack = ctx->current_sequence_num_other;
+      host_to_network(header);
       stcp_network_send(sd, header, sizeof(STCPHeader),NULL);
 
     } else {
       stcp_network_recv(sd,header,sizeof(STCPHeader));
-      
+      network_to_host(header);
+
       if(header->th_flags!= 0x10)
         ;//some error
       
@@ -109,10 +132,12 @@ void transport_init(mysocket_t sd, bool_t is_active)
 
       ctx->initial_sequence_num_other = header->th_ack;
 
+      host_to_network(header);
       stcp_network_send(sd, header, sizeof(STCPHeader),NULL);
 
       //listen for ack
       stcp_network_recv(sd,header,sizeof(STCPHeader));
+      network_to_host(header);
     }
 
     ctx->connection_state = CSTATE_ESTABLISHED;
@@ -142,7 +167,6 @@ static void generate_initial_seq_num(context_t *ctx)
 #endif
 }
 
-
 /* control_loop() is the main STCP loop; it repeatedly waits for one of the
  * following to happen:
  *   - incoming data from the peer
@@ -164,12 +188,16 @@ static void control_loop(mysocket_t sd, context_t *ctx)
     dst = (void *)malloc(536 + 4*offset);
     unsigned int data_size = 536;
 
+    //struct timeval *current_time;
+    //current_time = (timeval *)malloc(sizeof(timeval));
+
     while (!ctx->done)
     {
         unsigned int event;
 
         /* see stcp_api.h or stcp_api.c for details of this function */
         /* XXX: you will need to change some of these arguments! */
+        //gettimeofday(current_time, NULL);
         event = stcp_wait_for_event(sd, ANY_EVENT, NULL);
 
         /* check whether it was the network, app, or a close request */
@@ -186,6 +214,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
           header->th_flags = 0x0;
           header->th_win = ctx->congestion_window;
           unsigned int bytes_to_send = stcp_app_recv(sd, dst, data_size);
+          host_to_network(header);
           stcp_network_send(sd, header, sizeof(STCPHeader), dst, bytes_to_send, NULL);
 
           ctx->bytes_unacknowledged += bytes_to_send;
@@ -198,8 +227,9 @@ static void control_loop(mysocket_t sd, context_t *ctx)
           unsigned int bytes_received = stcp_network_recv(sd, dst, data_size + offset*4);
 
           memcpy((void *)header, dst, sizeof(STCPHeader));
+          network_to_host(header);
           /* printf("received network data \n"); */
-
+          
           ctx->window_size = (header->th_win > ctx->congestion_window) ? ctx->congestion_window : header->th_win;
 
           if(header->th_flags == 0x10){
@@ -215,6 +245,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             header->th_flags = 0x10;
             header->th_win = ctx->congestion_window;;
 
+            host_to_network(header);
             stcp_network_send(sd, header, offset*4, NULL);
 
             /* ctx->current_sequence_num_other = header->th_seq + bytes_received - offset*4; */
@@ -223,8 +254,12 @@ static void control_loop(mysocket_t sd, context_t *ctx)
 
         }
 
+        if(event == TIMEOUT){
+          ctx->done = TRUE;
+        }
+
         /* etc. */
-    }
+   }
 }
 
 
