@@ -37,12 +37,17 @@ typedef struct
     tcp_seq current_sequence_num_other;
     tcp_seq last_byte_acked;
 
+    tcp_seq window_size;
+    tcp_seq congestion_window;
+    tcp_seq bytes_unacknowledged;
+
     /* any other connection-wide global variables go here */
 } context_t;
 
 
 static void generate_initial_seq_num(context_t *ctx);
 static void control_loop(mysocket_t sd, context_t *ctx);
+
 
 
 /* initialise the transport layer, and start the main loop, handling
@@ -57,6 +62,9 @@ void transport_init(mysocket_t sd, bool_t is_active)
     assert(ctx);
 
     generate_initial_seq_num(ctx);
+    ctx->congestion_window = 3072;
+    ctx->window_size = 3072;
+    ctx->bytes_unacknowledged = 0;
 
     /* XXX: you should send a SYN packet here if is_active, or wait for one
      * to arrive if !is_active.  after the handshake completes, unblock the
@@ -129,7 +137,8 @@ static void generate_initial_seq_num(context_t *ctx)
     ctx->current_sequence_num = 1;
 #else
     /* you have to fill this up */
-    /*ctx->initial_sequence_num =;*/
+    ctx->initial_sequence_num = rand()%256;
+    ctx->current_sequence_num = ctx->initial_sequence_num;
 #endif
 }
 
@@ -165,17 +174,21 @@ static void control_loop(mysocket_t sd, context_t *ctx)
 
         /* check whether it was the network, app, or a close request */
         //app event
-        if (event & APP_DATA)
+        /* printf("current bytes unack %d  and app data:%d \n",ctx->bytes_unacknowledged, event&APP_DATA); */
+        if ((event & APP_DATA) && (ctx->bytes_unacknowledged + 536 < ctx->window_size))
         {
             /* the application has requested that data be sent */
             /* see stcp_app_recv() */
+          /* printf("received app data\n"); */
           header->th_ack = ctx->current_sequence_num_other;
           header->th_seq = ctx->current_sequence_num;
           header->th_off = offset;
           header->th_flags = 0x0;
+          header->th_win = ctx->congestion_window;
           unsigned int bytes_to_send = stcp_app_recv(sd, dst, data_size);
           stcp_network_send(sd, header, sizeof(STCPHeader), dst, bytes_to_send, NULL);
 
+          ctx->bytes_unacknowledged += bytes_to_send;
           ctx->current_sequence_num += bytes_to_send;
         }
 
@@ -183,22 +196,29 @@ static void control_loop(mysocket_t sd, context_t *ctx)
         if (event & NETWORK_DATA)
         {
           unsigned int bytes_received = stcp_network_recv(sd, dst, data_size + offset*4);
-          
+
           memcpy((void *)header, dst, sizeof(STCPHeader));
-          
-          if(header->th_flags != 0x10){
+          /* printf("received network data \n"); */
+
+          ctx->window_size = (header->th_win > ctx->congestion_window) ? ctx->congestion_window : header->th_win;
+
+          if(header->th_flags == 0x10){
+            ctx->last_byte_acked = header->th_seq - 1;
+            ctx->bytes_unacknowledged = ctx->current_sequence_num - header->th_ack;
+          }
+
+          if(bytes_received - offset*4 > 0){
+
             ctx->current_sequence_num_other += bytes_received - offset*4;
             header->th_ack = ctx->current_sequence_num_other;
             header->th_seq = ctx->current_sequence_num;
             header->th_flags = 0x10;
+            header->th_win = ctx->congestion_window;;
 
             stcp_network_send(sd, header, offset*4, NULL);
-            
-            ctx->current_sequence_num_other = header->th_seq + bytes_received - offset*4;
+
+            /* ctx->current_sequence_num_other = header->th_seq + bytes_received - offset*4; */
             stcp_app_send(sd, (char *)dst+offset*4, bytes_received - offset*4);
-          }
-          else {
-            ctx->last_byte_acked = header->th_seq - 1; 
           }
 
         }
