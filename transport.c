@@ -32,7 +32,10 @@ typedef struct
 
     int connection_state;   /* state of the connection (established, etc.) */
     tcp_seq initial_sequence_num;
+    tcp_seq current_sequence_num;
     tcp_seq initial_sequence_num_other;
+    tcp_seq current_sequence_num_other;
+    tcp_seq last_byte_acked;
 
     /* any other connection-wide global variables go here */
 } context_t;
@@ -71,16 +74,17 @@ void transport_init(mysocket_t sd, bool_t is_active)
       header->th_seq = ctx->initial_sequence_num;
       stcp_network_send(sd, header, sizeof(STCPHeader),NULL);
       
-      ctx->initial_sequence_num +=1;
+      ctx->current_sequence_num_other +=1;
 
       stcp_network_recv(sd,header,sizeof(STCPHeader));
       if(header->th_flags!= (0x10|0x02))
         ;//some error
-      ctx->initial_sequence_num_other = header->th_seq+1;
+      ctx->initial_sequence_num_other = header->th_seq;
+      ctx->current_sequence_num_other = header->th_seq+1;
 
       //ack
       header->th_flags = 0x10;
-      header->th_ack = ctx->initial_sequence_num_other;
+      header->th_ack = ctx->current_sequence_num_other;
       stcp_network_send(sd, header, sizeof(STCPHeader),NULL);
 
     } else {
@@ -91,6 +95,8 @@ void transport_init(mysocket_t sd, bool_t is_active)
       
       header->th_flags = 0x02 | 0x10;
       header->th_ack = header->th_seq + 1;
+      ctx->initial_sequence_num_other = header->th_seq;
+      ctx->current_sequence_num_other = header->th_seq+1;
       header->th_seq = ctx->initial_sequence_num;
 
       ctx->initial_sequence_num_other = header->th_ack;
@@ -120,6 +126,7 @@ static void generate_initial_seq_num(context_t *ctx)
 #ifdef FIXED_INITNUM
     /* please don't change this! */
     ctx->initial_sequence_num = 1;
+    ctx->current_sequence_num = 1;
 #else
     /* you have to fill this up */
     /*ctx->initial_sequence_num =;*/
@@ -139,19 +146,61 @@ static void control_loop(mysocket_t sd, context_t *ctx)
     assert(ctx);
     assert(!ctx->done);
 
+
+    unsigned int offset = (sizeof(STCPHeader)%4==0) ? sizeof(STCPHeader)/4 : sizeof(STCPHeader) + 1;
+    STCPHeader *header;
+    header = (STCPHeader *)malloc(sizeof(STCPHeader));
+
+    void *dst;
+    dst = (void *)malloc(536 + 4*offset);
+    unsigned int data_size = 536;
+
     while (!ctx->done)
     {
         unsigned int event;
 
         /* see stcp_api.h or stcp_api.c for details of this function */
         /* XXX: you will need to change some of these arguments! */
-        event = stcp_wait_for_event(sd, 0, NULL);
+        event = stcp_wait_for_event(sd, ANY_EVENT, NULL);
 
         /* check whether it was the network, app, or a close request */
+        //app event
         if (event & APP_DATA)
         {
             /* the application has requested that data be sent */
             /* see stcp_app_recv() */
+          header->th_ack = ctx->current_sequence_num_other;
+          header->th_seq = ctx->current_sequence_num;
+          header->th_off = offset;
+          header->th_flags = 0x0;
+          unsigned int bytes_to_send = stcp_app_recv(sd, dst, data_size);
+          stcp_network_send(sd, header, sizeof(STCPHeader), dst, bytes_to_send, NULL);
+
+          ctx->current_sequence_num += bytes_to_send;
+        }
+
+        //network event
+        if (event & NETWORK_DATA)
+        {
+          unsigned int bytes_received = stcp_network_recv(sd, dst, data_size + offset*4);
+          
+          memcpy((void *)header, dst, sizeof(STCPHeader));
+          
+          if(header->th_flags != 0x10){
+            ctx->current_sequence_num_other += bytes_received - offset*4;
+            header->th_ack = ctx->current_sequence_num_other;
+            header->th_seq = ctx->current_sequence_num;
+            header->th_flags = 0x10;
+
+            stcp_network_send(sd, header, offset*4, NULL);
+            
+            ctx->current_sequence_num_other = header->th_seq + bytes_received - offset*4;
+            stcp_app_send(sd, (char *)dst+offset*4, bytes_received - offset*4);
+          }
+          else {
+            ctx->last_byte_acked = header->th_seq - 1; 
+          }
+
         }
 
         /* etc. */
