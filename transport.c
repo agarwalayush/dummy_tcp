@@ -22,7 +22,7 @@
 #include "mysock_impl.h"
 
 
-enum { CSTATE_ESTABLISHED };    /* you should have more states */
+enum { CSTATE_ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, CLOSED };    /* you should have more states */
 
 
 /* this structure is global to a mysocket descriptor */
@@ -104,25 +104,37 @@ void transport_init(mysocket_t sd, bool_t is_active)
       
       ctx->current_sequence_num_other +=1;
 
-      stcp_network_recv(sd,header,sizeof(STCPHeader));
-      network_to_host(header);
-      if(header->th_flags!= (0x10|0x02))
-        ;//some error
+      do {
+        stcp_network_recv(sd,header,sizeof(STCPHeader));
+        network_to_host(header);
+      } while(!(header->th_flags & 0x10 || header->th_flags & 0x02));
+
+      int mark=0;
+      if(header->th_flags == 0x02) mark=1;
+
       ctx->initial_sequence_num_other = header->th_seq;
       ctx->current_sequence_num_other = header->th_seq+1;
 
       //ack
       header->th_flags = 0x10;
+      header->th_seq = ctx->current_sequence_num;
       header->th_ack = ctx->current_sequence_num_other;
       host_to_network(header);
       stcp_network_send(sd, header, sizeof(STCPHeader),NULL);
 
-    } else {
-      stcp_network_recv(sd,header,sizeof(STCPHeader));
-      network_to_host(header);
+      //listening for ack if simultaneous syn
+      if(mark){
+        do {
+          stcp_network_recv(sd,header,sizeof(STCPHeader));
+          network_to_host(header);
+        } while(!(header->th_flags & 0x10));
+      }
 
-      if(header->th_flags!= 0x10)
-        ;//some error
+    } else {
+      do{
+        stcp_network_recv(sd,header,sizeof(STCPHeader));
+        network_to_host(header);
+      } while (!(header->th_flags & 0x02));
       
       header->th_flags = 0x02 | 0x10;
       header->th_ack = header->th_seq + 1;
@@ -136,8 +148,11 @@ void transport_init(mysocket_t sd, bool_t is_active)
       stcp_network_send(sd, header, sizeof(STCPHeader),NULL);
 
       //listen for ack
-      stcp_network_recv(sd,header,sizeof(STCPHeader));
-      network_to_host(header);
+      do {
+        stcp_network_recv(sd,header,sizeof(STCPHeader));
+        network_to_host(header);
+      } while(!(header->th_flags & 0x10));
+    
     }
 
     ctx->connection_state = CSTATE_ESTABLISHED;
@@ -180,7 +195,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
     assert(!ctx->done);
 
 
-    unsigned int offset = (sizeof(STCPHeader)%4==0) ? sizeof(STCPHeader)/4 : sizeof(STCPHeader) + 1;
+    unsigned int offset = (sizeof(STCPHeader)%4==0) ? sizeof(STCPHeader)/4 : sizeof(STCPHeader)/4 + 1;
     STCPHeader *header;
     header = (STCPHeader *)malloc(sizeof(STCPHeader));
 
@@ -232,16 +247,44 @@ static void control_loop(mysocket_t sd, context_t *ctx)
           
           ctx->window_size = (header->th_win > ctx->congestion_window) ? ctx->congestion_window : header->th_win;
 
-          if(header->th_flags == 0x10){
-            ctx->last_byte_acked = header->th_seq - 1;
-            ctx->bytes_unacknowledged = ctx->current_sequence_num - header->th_ack;
+          if(header->th_flags & 0x10){ //if ack
+          
+            if(ctx->connection_state == FIN_WAIT_1)
+              ctx->connection_state = FIN_WAIT_2;
+            else {
+              ctx->last_byte_acked = header->th_seq - 1;
+              ctx->bytes_unacknowledged = ctx->current_sequence_num - header->th_ack;
+            }
+          
+          } else if(header->th_flags & 0x01) { //if fin
+            
+            if(ctx->connection_state == FIN_WAIT_2)
+              ctx->connection_state = CLOSED;
+            else if(ctx->connection_state == FIN_WAIT_1){
+              ctx->connection_state = CLOSED;
+            } else{
+              ctx->connection_state = CLOSE_WAIT;
+              stcp_fin_received(sd);
+            }
+              /* header->th_ack = ctx->current_sequence_num_other; */
+              /* header->th_seq = ctx->current_sequence_num; */
+              /* ctx->current_sequence_num++; */
+              /* header->th_flags = 0x10; */
+              /* header->th_win = ctx->congestion_window;; */
+
+              /* host_to_network(header); */
+              /* stcp_network_send(sd, header, offset*4, NULL); */
+              if(ctx->connection_state == CLOSED)
+                ctx->done = TRUE;
+              continue;
           }
 
-          if(bytes_received - offset*4 > 0){
+          if(bytes_received - header->th_off*4 > 0){
 
             ctx->current_sequence_num_other += bytes_received - offset*4;
             header->th_ack = ctx->current_sequence_num_other;
             header->th_seq = ctx->current_sequence_num;
+            ctx->current_sequence_num++;
             header->th_flags = 0x10;
             header->th_win = ctx->congestion_window;;
 
@@ -254,12 +297,31 @@ static void control_loop(mysocket_t sd, context_t *ctx)
 
         }
 
+        if (event & APP_CLOSE_REQUESTED){
+            header->th_ack = ctx->current_sequence_num_other;
+            header->th_seq = ctx->current_sequence_num;
+            ctx->current_sequence_num++;
+            header->th_flags = TH_FIN;
+            header->th_win = ctx->congestion_window;;
+
+            host_to_network(header);
+            stcp_network_send(sd, header, offset*4, NULL);
+
+            if(ctx->connection_state == CLOSE_WAIT){
+              ctx->connection_state = CLOSED;
+              ctx->done = TRUE;
+            } else ctx->connection_state = FIN_WAIT_1;
+
+        }
+
+
         if(event == TIMEOUT){
           ctx->done = TRUE;
         }
 
         /* etc. */
    }
+  printf("connection closed");
 }
 
 
